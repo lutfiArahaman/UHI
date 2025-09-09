@@ -1,0 +1,160 @@
+// ===============================
+// UHI STACK with Sampling (LST, NDVI, NDBI, UHI)
+// AOI: projects/spatial-country-433907-t2/assets/Selangor
+// UHI legend: 5 threshold classes (discrete)
+// ===============================
+
+// -------- SETTINGS --------
+var YEAR = 2024;
+var DATE_START = YEAR + '-01-01';
+var DATE_END   = YEAR + '-12-31';
+
+var AOI = ee.FeatureCollection('projects/spatial-country-433907-t2/assets/Selangor')
+            .geometry();
+
+// Visualization presets (continuous for LST/NDVI/NDBI)
+var VIS = {
+  LST_C:   {min: 20, max: 45, palette: ['040274','2c7bb6','abd9e9','ffffbf','fdae61','d7191c']},
+  NDVI:    {min: -0.5, max: 1.0, palette: ['#d73027','#f46d43','#fdae61','#fee08b','#d9ef8b','#a6d96a','#66bd63','#1a9850','#006837']},
+  NDBI:    {min: -0.5, max: 0.5, palette: ['#2c7bb6','#abd9e9','#ffffbf','#fdae61','#d7191c']}
+};
+
+// UHI class thresholds (°C) and colors (5 classes)
+// Classes: [0–2), [2–4), [4–6), [6–8), [>=8]
+var UHI_THRESHOLDS = [0, 2, 4, 6, 8]; // lower bounds of classes
+var UHI_CLASS_COLORS = [
+  '#ffffcc', // 0–2
+  '#fed976', // 2–4
+  '#fd8d3c', // 4–6
+  '#f03b20', // 6–8
+  '#bd0026'  // >=8
+];
+var UHI_CLASS_LABELS = [
+  '0 – <2 °C',
+  '2 – <4 °C',
+  '4 – <6 °C',
+  '6 – <8 °C',
+  '≥ 8 °C'
+];
+
+// -------- HELPERS --------
+function maskL2(img) {
+  var qa = img.select('QA_PIXEL');
+  var cloudShadowBit = 1 << 3;
+  var snowBit        = 1 << 4;
+  var cloudBit       = 1 << 5;
+  var cirrusBit      = 1 << 7;
+  var mask = qa.bitwiseAnd(cloudShadowBit).eq(0)
+              .and(qa.bitwiseAnd(snowBit).eq(0))
+              .and(qa.bitwiseAnd(cloudBit).eq(0))
+              .and(qa.bitwiseAnd(cirrusBit).eq(0));
+  return img.updateMask(mask);
+}
+
+function scaleL2(img) {
+  var sr = img.select(['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7'])
+              .multiply(0.0000275).add(-0.2)
+              .rename(['B2','B3','B4','B5','B6','B7']);
+  var lstK = img.select('ST_B10').multiply(0.00341802).add(149.0).rename('LST_K');
+  return img.addBands(sr, null, true).addBands(lstK);
+}
+
+function addIndices(img) {
+  var ndvi = img.normalizedDifference(['B5','B4']).rename('NDVI');
+  var ndbi = img.normalizedDifference(['B6','B5']).rename('NDBI');
+  var lstC = img.select('LST_K').subtract(273.15).rename('LST_C');
+  return img.addBands([ndvi, ndbi, lstC]);
+}
+
+// -------- COLLECTION --------
+var col = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2'))
+    .filterBounds(AOI)
+    .filterDate(DATE_START, DATE_END)
+    .filter(ee.Filter.lt('CLOUD_COVER', 60))
+    .map(maskL2)
+    .map(scaleL2)
+    .map(addIndices);
+
+var comp = col.median().clip(AOI);
+
+// -------- SAMPLING FOR UHI BASELINE --------
+// Random sample (keeps memory usage low)
+var sample = comp.select('LST_C').sample({
+  region: AOI,
+  scale: 500,        // sampling scale
+  numPixels: 5000,   // sample size
+  seed: 42
+});
+
+// 10th percentile of sampled LST (cool baseline)
+var lstP10 = ee.Number(
+  sample.reduceColumns({
+    reducer: ee.Reducer.percentile([10]),
+    selectors: ['LST_C']
+  }).get('p10')
+);
+
+// UHI as anomaly vs baseline
+var UHI_C = comp.select('LST_C').subtract(lstP10).rename('UHI_C');
+
+// Create 5-class UHI image (0..4)
+// bins: [0,2,4,6,8, +inf)
+var edges = UHI_THRESHOLDS.concat([1e6]); // append large upper edge
+var UHI_class = UHI_C.lt(edges[1]).multiply(0)
+  .where(UHI_C.gte(edges[1]).and(UHI_C.lt(edges[2])), 1)
+  .where(UHI_C.gte(edges[2]).and(UHI_C.lt(edges[3])), 2)
+  .where(UHI_C.gte(edges[3]).and(UHI_C.lt(edges[4])), 3)
+  .where(UHI_C.gte(edges[4]), 4)
+  .updateMask(UHI_C.gte(0)) // hide negative anomalies (optional)
+  .rename('UHI_5class');
+
+// -------- MAP LAYERS --------
+Map.centerObject(AOI, 9);
+Map.addLayer(comp.select('LST_C'), VIS.LST_C, 'LST (°C)');
+Map.addLayer(comp.select('NDVI'),  VIS.NDVI,  'NDVI');
+Map.addLayer(comp.select('NDBI'),  VIS.NDBI,  'NDBI');
+
+// Render UHI as 5 classes to match the discrete legend
+Map.addLayer(UHI_class, {min: 0, max: 4, palette: UHI_CLASS_COLORS}, 'UHI (°C, 5-class)');
+
+// -------- LEGENDS --------
+// Continuous legend helper (unchanged for LST/NDVI/NDBI)
+function makeContinuousLegend(title, vis, units) {
+  var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px', width: '220px'}});
+  var titleLabel = ui.Label({value: title, style: {fontWeight: 'bold', fontSize: '12px', margin: '0 0 4px 0'}});
+  var bar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select(0)
+            .multiply((vis.max - vis.min) / 100.0).add(vis.min)
+            .visualize({min: vis.min, max: vis.max, palette: vis.palette}),
+    params: {bbox: [0,0,100,10], dimensions: '200x20'},
+    style: {stretch: 'horizontal', margin: '0px'}
+  });
+  var minLabel = ui.Label(vis.min + (units ? ' ' + units : ''), {fontSize: '10px'});
+  var maxLabel = ui.Label(vis.max + (units ? ' ' + units : ''), {fontSize: '10px', textAlign: 'right', stretch: 'horizontal'});
+  legend.add(titleLabel).add(bar).add(ui.Panel([minLabel, maxLabel], ui.Panel.Layout.flow('horizontal')));
+  return legend;
+}
+
+// Discrete (class) legend for UHI
+function makeClassLegend(title, labels, colors) {
+  var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px', width: '220px'}});
+  legend.add(ui.Label({value: title, style: {fontWeight: 'bold', fontSize: '12px', margin: '0 0 4px 0'}}));
+  for (var i = 0; i < labels.length; i++) {
+    var colorBox = ui.Label('', {
+      backgroundColor: colors[i],
+      padding: '8px',
+      margin: '0 6px 0 0'
+    });
+    var desc = ui.Label(labels[i], {fontSize: '11px'});
+    var row = ui.Panel([colorBox, desc], ui.Panel.Layout.flow('horizontal'));
+    legend.add(row);
+  }
+  return legend;
+}
+
+// Add legends to map
+Map.add(makeContinuousLegend('LST (°C)', VIS.LST_C, '°C'));
+Map.add(makeContinuousLegend('NDVI', VIS.NDVI, ''));
+Map.add(makeContinuousLegend('NDBI', VIS.NDBI, ''));
+Map.add(makeClassLegend('UHI (°C) — 5 classes', UHI_CLASS_LABELS, UHI_CLASS_COLORS));
