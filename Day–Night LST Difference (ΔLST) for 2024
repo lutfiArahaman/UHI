@@ -1,0 +1,135 @@
+// ===============================================
+// Monthly Day–Night LST Difference (ΔLST) for 2024
+// AOI: Shah Alam Population Boundary
+// Sensor: MODIS MOD11A2 (LST_Day_1km, LST_Night_1km)
+// Output: Monthly median Day, Night, ΔLST (°C) over 2024
+// ===============================================
+
+// 1. AOI: Shah Alam Pop Boundary
+var roiFc = ee.FeatureCollection(
+  '(Area of Interest)'
+);
+var roi = roiFc.geometry();
+
+Map.centerObject(roi, 11);
+Map.addLayer(roi, {color: 'yellow'}, 'AOI - Shah Alam');
+
+// 2. Time range: full year 2024
+var year = 2024;
+var startDate = ee.Date(year + '-01-01');
+var endDate   = ee.Date((year + 1) + '-01-01');  // exclusive upper bound
+
+// 3. Base MODIS collections (filtered once)
+var modisDayRaw = ee.ImageCollection('MODIS/061/MOD11A2')
+  .select('LST_Day_1km')
+  .filterDate(startDate, endDate)
+  .filterBounds(roi);
+
+var modisNightRaw = ee.ImageCollection('MODIS/061/MOD11A2')
+  .select('LST_Night_1km')
+  .filterDate(startDate, endDate)
+  .filterBounds(roi);
+
+// 4. Build monthly composites (Day, Night, ΔLST) in °C
+var nMonths = 12;
+var months = ee.List.sequence(0, nMonths - 1);
+
+var monthlyLST = ee.ImageCollection.fromImages(
+  months.map(function(m) {
+    m = ee.Number(m);
+    var monthStart = startDate.advance(m, 'month');
+    var monthEnd   = monthStart.advance(1, 'month');
+
+    // Monthly median Day (K → °C)
+    var dayK = modisDayRaw
+      .filterDate(monthStart, monthEnd)
+      .median()
+      .multiply(0.02);
+    var dayC = dayK.subtract(273.15).rename('LST_Day_C');
+
+    // Monthly median Night (K → °C)
+    var nightK = modisNightRaw
+      .filterDate(monthStart, monthEnd)
+      .median()
+      .multiply(0.02);
+    var nightC = nightK.subtract(273.15).rename('LST_Night_C');
+
+    // ΔLST = Day - Night (°C)
+    var delta = dayC.subtract(nightC).rename('Delta_LST_C');
+
+    // Stack & set time
+    var img = dayC.addBands(nightC).addBands(delta)
+      .clip(roi)
+      .toFloat()
+      .set('system:time_start', monthStart.millis())
+      .set('month', m.add(1));  // 1–12
+
+    return img;
+  })
+);
+
+// Debug: how many monthly images?
+print('Monthly LST ImageCollection (Day, Night, ΔLST)', monthlyLST);
+print('Number of months:', monthlyLST.size());
+
+// 5. Visualize one example month (e.g., January)
+var janImg = ee.Image(
+  monthlyLST.filter(ee.Filter.eq('month', 1)).first()
+);
+
+var visDay = {
+  min: 20, max: 45,
+  palette: ['040274','2c7bb6','abd9e9','ffffbf','fdae61','d7191c']
+};
+var visNight = {
+  min: 15, max: 35,
+  palette: ['040274','2c7bb6','abd9e9','ffffbf','fdae61','d7191c']
+};
+var visDelta = {
+  min: 0, max: 15,
+  palette: ['#081d58','#225ea8','#1d91c0','#41b6c4','#7fcdbb','#c7e9b4','#ffffcc']
+};
+
+Map.addLayer(janImg.select('LST_Day_C'),   visDay,   'Jan 2024 LST Day (°C)', false);
+Map.addLayer(janImg.select('LST_Night_C'), visNight, 'Jan 2024 LST Night (°C)', false);
+Map.addLayer(janImg.select('Delta_LST_C'), visDelta, 'Jan 2024 ΔLST (Day–Night, °C)', true);
+
+// 6. Time series chart of monthly mean ΔLST in AOI
+var deltaSeries = monthlyLST.select('Delta_LST_C');
+
+var chartDelta = ui.Chart.image.series({
+  imageCollection: deltaSeries,
+  region: roi,
+  reducer: ee.Reducer.mean(),
+  scale: 1000,
+  xProperty: 'system:time_start'
+}).setOptions({
+  title: 'Monthly Mean ΔLST (Day–Night) — Shah Alam, ' + year,
+  vAxis: {title: 'ΔLST (°C)'},
+  hAxis: {title: 'Month'},
+  lineWidth: 2,
+  pointSize: 5,
+  colors: ['#d73027']
+});
+
+print(chartDelta);
+
+// 7. Export: monthly ΔLST stack (12 bands, one per month)
+var deltaStack = deltaSeries.map(function(img) {
+  var month = ee.Number(img.get('month')).format('%02d');
+  var bandName = ee.String('Delta_LST_').cat(month);  // e.g., Delta_LST_01
+  return img.select('Delta_LST_C').rename(bandName);
+}).toBands().toFloat();
+
+print('DeltaLST stack (band names = months):', deltaStack.bandNames());
+
+Export.image.toDrive({
+  image: deltaStack,
+  description: 'ShahAlam_MODIS_DeltaLST_Monthly_2024',
+  folder: 'test',
+  fileNamePrefix: 'ShahAlam_MODIS_DeltaLST_Monthly_2024',
+  scale: 1000,
+  region: roi,
+  maxPixels: 1e13,
+  crs: 'EPSG:4326'
+});
